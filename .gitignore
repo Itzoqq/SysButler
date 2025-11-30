@@ -8,6 +8,7 @@ bin/
 *.obj
 *.lib
 *.dll
+*.ini
 
 # --- vcpkg (Dependencies) ---
 # We ignore the installed libraries because vcpkg.json will
@@ -17,6 +18,9 @@ vcpkg_installed/
 # We also ignore the vcpkg tool itself since it's a separate repo.
 # (Users should clone vcpkg themselves or use a submodule)
 vcpkg/
+
+# Exclude log files
+logs/
 
 # --- IDE Settings ---
 .vscode/
