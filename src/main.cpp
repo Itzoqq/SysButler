@@ -9,6 +9,8 @@
 #include <vector>
 #include <filesystem>
 #include <windows.h> // For GetLogicalDrives
+#include <algorithm> // For search case-insensitivity
+#include <cctype>
 
 // YOUR HEADERS
 #include "Jobs/TransferManager.h"
@@ -27,40 +29,69 @@ struct FileEntry {
 
 struct BrowserState {
     fs::path currentPath;
-    fs::path selectedPath; // The specific file or folder selected
+    fs::path selectedPath; 
     std::vector<FileEntry> entries;
     int selectedIndex = -1;
     char currentDrive = 'C';
     
-    // Constructor sets default path
+    // NEW: Search Buffer
+    char searchFilter[256] = ""; 
+
     BrowserState() {
-        currentPath = fs::current_path().root_path(); // Start at C:\ usually
+        currentPath = fs::current_path().root_path(); 
         Refresh();
     }
 
     void Refresh() {
         entries.clear();
-        selectedIndex = -1;
+        // Note: We do NOT reset selectedIndex here if we are trying to preserve selection,
+        // but typically a refresh invalidates indices. We will handle "Jump to File" separately.
+        selectedIndex = -1; 
+        
         try {
             for (const auto& entry : fs::directory_iterator(currentPath)) {
                 FileEntry e;
                 e.path = entry.path();
                 e.isDirectory = entry.is_directory();
-                // Format: [DIR] Name or Name
                 e.displayString = (e.isDirectory ? "[DIR] " : "      ") + e.path.filename().string();
                 entries.push_back(e);
             }
-            // Simple sort: Directories first
             std::sort(entries.begin(), entries.end(), [](const FileEntry& a, const FileEntry& b) {
                 if (a.isDirectory != b.isDirectory) return a.isDirectory > b.isDirectory;
                 return a.path < b.path;
             });
-        } catch (...) {
-            // Permission denied or other error
+        } catch (...) {}
+    }
+
+    void NavigateToFile(const std::filesystem::path& targetFile) {
+        if (!fs::exists(targetFile)) return;
+
+        // 1. Change Directory to the file's parent
+        currentPath = targetFile.parent_path();
+        
+        // 2. Update Drive Letter
+        std::string pathStr = currentPath.string();
+        if (pathStr.length() >= 2 && pathStr[1] == ':') {
+            currentDrive = toupper(pathStr[0]);
+        }
+
+        // 3. Refresh the list to load new files
+        Refresh();
+
+        // 4. Find and Select the specific file
+        selectedPath = targetFile;
+        // Clear search so the file is actually visible
+        memset(searchFilter, 0, sizeof(searchFilter)); 
+
+        for (int i = 0; i < entries.size(); i++) {
+            if (entries[i].path == targetFile) {
+                selectedIndex = i;
+                break;
+            }
         }
     }
 
-    void NavigateUp() {
+    void NavigateUp() { /* ... existing code ... */ 
         if (currentPath.has_parent_path() && currentPath != currentPath.root_path()) {
             currentPath = currentPath.parent_path();
             Refresh();
@@ -68,7 +99,7 @@ struct BrowserState {
         }
     }
     
-    void ChangeDrive(char driveLetter) {
+    void ChangeDrive(char driveLetter) { /* ... existing code ... */ 
         std::string d = std::string(1, driveLetter) + ":\\";
         currentPath = d;
         currentDrive = driveLetter;
@@ -77,19 +108,35 @@ struct BrowserState {
     }
 };
 
-// Helper to render the browser UI
+bool StringContains(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    auto it = std::search(
+        haystack.begin(), haystack.end(),
+        needle.begin(), needle.end(),
+        [](char ch1, char ch2) { return std::toupper(ch1) == std::toupper(ch2); }
+    );
+    return (it != haystack.end());
+}
+
 void RenderFileBrowser(const char* id, BrowserState& state, float height) {
     ImGui::PushID(id);
     ImGui::BeginGroup();
 
-    // 1. Header: Drive Selector and Up Button
-    if (ImGui::Button("..")) { state.NavigateUp(); }
-    ImGui::SameLine();
+    // --- TOOLBAR ROW ---
     
-    // Simple Drive Selector (A-Z)
+    // 1. Up Arrow (Replaces ".." button)
+    // ImGuiDir_Up renders a small triangle pointing up
+    if (ImGui::ArrowButton("##up", ImGuiDir_Up)) { 
+        state.NavigateUp(); 
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to Parent Folder");
+
+    ImGui::SameLine();
+
+    // 2. Drive Selector
     char driveLabel[4] = "C:\\";
     driveLabel[0] = state.currentDrive;
-    ImGui::SetNextItemWidth(60);
+    ImGui::SetNextItemWidth(50);
     if (ImGui::BeginCombo("##drive", driveLabel)) {
         DWORD mask = GetLogicalDrives();
         for (char c = 'A'; c <= 'Z'; c++) {
@@ -103,25 +150,60 @@ void RenderFileBrowser(const char* id, BrowserState& state, float height) {
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
-    ImGui::Text("%s", state.currentPath.string().c_str());
 
-    // 2. File List (Scrollable Area)
+    ImGui::SameLine();
+
+    // 3. Search Box (Takes available width minus the space needed for the "..." button)
+    float availableWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(availableWidth - 40.0f); // Leave 40px for the "..." button
+    ImGui::InputTextWithHint("##search", "Search files...", state.searchFilter, IM_ARRAYSIZE(state.searchFilter));
+
+    ImGui::SameLine();
+
+    // 4. "..." Button (Native Explorer Integration)
+    if (ImGui::Button("...")) {
+        // Use your existing PlatformUtils to pick a file
+        std::string picked = PlatformUtils::OpenFilePicker();
+        if (!picked.empty()) {
+            state.NavigateToFile(std::filesystem::path(picked));
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Locate file using Windows Explorer");
+
+    // --- PATH DISPLAY ---
+    // Small text showing full current path
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", state.currentPath.string().c_str());
+
+    // --- FILE LIST ---
     ImGui::BeginChild("Files", ImVec2(0, height), true);
+    
     for (int i = 0; i < state.entries.size(); i++) {
         const auto& entry = state.entries[i];
+        
+        // FILTER LOGIC: Skip item if it doesn't match search
+        if (!StringContains(entry.path.filename().string(), state.searchFilter)) {
+            continue;
+        }
+
         bool isSelected = (state.selectedIndex == i);
         
+        // Render Item
         if (ImGui::Selectable(entry.displayString.c_str(), isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
             state.selectedIndex = i;
             state.selectedPath = entry.path;
             
-            // Handle Navigation on Double Click
             if (ImGui::IsMouseDoubleClicked(0) && entry.isDirectory) {
                 state.currentPath = entry.path;
+                // Clear search when entering a new folder so we see contents
+                memset(state.searchFilter, 0, sizeof(state.searchFilter));
                 state.Refresh();
-                state.selectedPath = state.currentPath; // When entering a folder, the folder itself is the context
+                state.selectedPath = state.currentPath;
             }
+        }
+
+        // Auto-scroll to selection if we just jumped here (optional polish)
+        if (isSelected && ImGui::IsWindowAppearing()) {
+            ImGui::SetScrollHereY();
         }
     }
     ImGui::EndChild();
