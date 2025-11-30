@@ -6,11 +6,137 @@
 #include <string>
 #include <filesystem> 
 #include <objbase.h> // Required for CoInitializeEx
+#include <vector>
+#include <filesystem>
+#include <windows.h> // For GetLogicalDrives
 
 // YOUR HEADERS
 #include "Jobs/TransferManager.h"
 #include "Core/Logger.h"
 #include "Core/PlatformUtils.h"
+
+namespace fs = std::filesystem;
+
+// --- FILE BROWSER UTILS ---
+
+struct FileEntry {
+    fs::path path;
+    bool isDirectory;
+    std::string displayString;
+};
+
+struct BrowserState {
+    fs::path currentPath;
+    fs::path selectedPath; // The specific file or folder selected
+    std::vector<FileEntry> entries;
+    int selectedIndex = -1;
+    char currentDrive = 'C';
+    
+    // Constructor sets default path
+    BrowserState() {
+        currentPath = fs::current_path().root_path(); // Start at C:\ usually
+        Refresh();
+    }
+
+    void Refresh() {
+        entries.clear();
+        selectedIndex = -1;
+        try {
+            for (const auto& entry : fs::directory_iterator(currentPath)) {
+                FileEntry e;
+                e.path = entry.path();
+                e.isDirectory = entry.is_directory();
+                // Format: [DIR] Name or Name
+                e.displayString = (e.isDirectory ? "[DIR] " : "      ") + e.path.filename().string();
+                entries.push_back(e);
+            }
+            // Simple sort: Directories first
+            std::sort(entries.begin(), entries.end(), [](const FileEntry& a, const FileEntry& b) {
+                if (a.isDirectory != b.isDirectory) return a.isDirectory > b.isDirectory;
+                return a.path < b.path;
+            });
+        } catch (...) {
+            // Permission denied or other error
+        }
+    }
+
+    void NavigateUp() {
+        if (currentPath.has_parent_path() && currentPath != currentPath.root_path()) {
+            currentPath = currentPath.parent_path();
+            Refresh();
+            selectedPath.clear();
+        }
+    }
+    
+    void ChangeDrive(char driveLetter) {
+        std::string d = std::string(1, driveLetter) + ":\\";
+        currentPath = d;
+        currentDrive = driveLetter;
+        Refresh();
+        selectedPath.clear();
+    }
+};
+
+// Helper to render the browser UI
+void RenderFileBrowser(const char* id, BrowserState& state, float height) {
+    ImGui::PushID(id);
+    ImGui::BeginGroup();
+
+    // 1. Header: Drive Selector and Up Button
+    if (ImGui::Button("..")) { state.NavigateUp(); }
+    ImGui::SameLine();
+    
+    // Simple Drive Selector (A-Z)
+    char driveLabel[4] = "C:\\";
+    driveLabel[0] = state.currentDrive;
+    ImGui::SetNextItemWidth(60);
+    if (ImGui::BeginCombo("##drive", driveLabel)) {
+        DWORD mask = GetLogicalDrives();
+        for (char c = 'A'; c <= 'Z'; c++) {
+            if (mask & 1) {
+                char d[4] = "X:\\"; d[0] = c;
+                if (ImGui::Selectable(d, state.currentDrive == c)) {
+                    state.ChangeDrive(c);
+                }
+            }
+            mask >>= 1;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::Text("%s", state.currentPath.string().c_str());
+
+    // 2. File List (Scrollable Area)
+    ImGui::BeginChild("Files", ImVec2(0, height), true);
+    for (int i = 0; i < state.entries.size(); i++) {
+        const auto& entry = state.entries[i];
+        bool isSelected = (state.selectedIndex == i);
+        
+        if (ImGui::Selectable(entry.displayString.c_str(), isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
+            state.selectedIndex = i;
+            state.selectedPath = entry.path;
+            
+            // Handle Navigation on Double Click
+            if (ImGui::IsMouseDoubleClicked(0) && entry.isDirectory) {
+                state.currentPath = entry.path;
+                state.Refresh();
+                state.selectedPath = state.currentPath; // When entering a folder, the folder itself is the context
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::EndGroup();
+    ImGui::PopID();
+}
+
+int CountCompletedJobs(const std::deque<std::shared_ptr<FileJob>>& queue) {
+    int count = 0;
+    for (const auto& job : queue) {
+        if (job->status == JobStatus::Completed) count++;
+    }
+    return count;
+}
 
 // Helper to keep the UI state clean
 struct UIState {
@@ -57,228 +183,215 @@ int main(int, char**)
     UIState uiState;
 
     // 5. Main Loop
+   // --- INSTANTIATE MANAGER & STATES ---
+    BrowserState leftBrowser;  
+    BrowserState rightBrowser; 
+    
+    // UI State Tracking
+    int selectedQueueIndex = -1; 
+    int previousCompletedCount = 0; // To detect when to refresh
+
+    // 5. Main Loop
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
+
+        // 1. Check for Auto-Refresh (If a job finished, refresh file lists)
+        // We do this at the start of the frame to keep UI up to date
+        int currentCompletedCount = CountCompletedJobs(transferManager.GetQueue());
+        if (currentCompletedCount > previousCompletedCount) {
+            leftBrowser.Refresh();
+            rightBrowser.Refresh();
+            ButlerLogger::Log("Job finished. Refreshing file browsers.");
+        }
+        previousCompletedCount = currentCompletedCount;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // --- SYSBUTLER UI START ---
-        
-        // Make the window fill the whole app for a "Dashboard" feel
+        // Setup Window
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
 
         // Header
-        ImGui::TextDisabled("SYSBUTLER // FILE OPERATIONS");
+        ImGui::TextDisabled("SYSBUTLER // FILE COMMANDER");
         ImGui::Separator();
-        ImGui::Spacing();
-
-        // SPLIT LAYOUT: LEFT (Input) vs RIGHT (Queue)
-        ImGui::Columns(2, "MainLayout", true); 
         
-        // --- LEFT COLUMN: INPUTS ---
-        ImGui::Text("Add to Transfer Queue");
+        // --- TOP SECTION: DUAL PANE EXPLORER ---
+        float paneHeight = 350.0f; // Adjusted height
         
-        // 1. SOURCE INPUT + PICKERS
-        ImGui::Text("Source Path");
-        ImGui::PushItemWidth(-100); // Leave room for 2 buttons
-        ImGui::InputText("##Source", uiState.sourceBuffer, IM_ARRAYSIZE(uiState.sourceBuffer));
-        ImGui::PopItemWidth();
+        ImGui::Columns(2, "ExplorerCols", true);
         
-        ImGui::SameLine();
-        if (ImGui::Button("File##Src", ImVec2(40, 0))) { 
-            std::string selected = PlatformUtils::OpenFilePicker();
-            if (!selected.empty()) {
-                strncpy(uiState.sourceBuffer, selected.c_str(), sizeof(uiState.sourceBuffer) - 1);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Fold##Src", ImVec2(40, 0))) { 
-            std::string selected = PlatformUtils::OpenFolderPicker();
-            if (!selected.empty()) {
-                strncpy(uiState.sourceBuffer, selected.c_str(), sizeof(uiState.sourceBuffer) - 1);
-            }
-        }
-
-        // 2. DEST INPUT + PICKERS
-        ImGui::Text("Dest Path");
-        ImGui::PushItemWidth(-100); 
-        ImGui::InputText("##Dest", uiState.destBuffer, IM_ARRAYSIZE(uiState.destBuffer));
-        ImGui::PopItemWidth();
-
-        ImGui::SameLine();
-        if (ImGui::Button("File##Dst", ImVec2(40, 0))) { 
-            // File picker for dest: assume user wants the parent folder of the file they picked
-            std::string selected = PlatformUtils::OpenFilePicker();
-            if (!selected.empty()) {
-                std::filesystem::path p(selected);
-                std::string folder = p.parent_path().string();
-                strncpy(uiState.destBuffer, folder.c_str(), sizeof(uiState.destBuffer) - 1);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Fold##Dst", ImVec2(40, 0))) { 
-             std::string selected = PlatformUtils::OpenFolderPicker();
-             if (!selected.empty()) {
-                strncpy(uiState.destBuffer, selected.c_str(), sizeof(uiState.destBuffer) - 1);
-             }
-        }
-        
-        ImGui::Spacing();
-
-        // ACTION BUTTONS (Split 2 Columns internally)
-        ImGui::Columns(2, "ButtonColumns", false); 
-
-        // Button 1: COPY (Blue)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.4f, 0.8f, 1.0f)); 
-        if (ImGui::Button("Queue COPY Job", ImVec2(-1, 40))) {
-            if (strlen(uiState.sourceBuffer) > 0 && strlen(uiState.destBuffer) > 0) {
-                transferManager.QueueJob(uiState.sourceBuffer, uiState.destBuffer, JobType::Copy);
-            }
-        }
-        ImGui::PopStyleColor();
-
+        // LEFT PANE
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "SOURCE");
+        RenderFileBrowser("LeftPane", leftBrowser, paneHeight);
         ImGui::NextColumn();
+        
+        // RIGHT PANE
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "DESTINATION");
+        RenderFileBrowser("RightPane", rightBrowser, paneHeight);
+        ImGui::Columns(1); 
 
-        // Button 2: MOVE (Orange)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.4f, 0.2f, 1.0f)); 
-        if (ImGui::Button("Queue MOVE Job", ImVec2(-1, 40))) {
-            if (strlen(uiState.sourceBuffer) > 0 && strlen(uiState.destBuffer) > 0) {
-                transferManager.QueueJob(uiState.sourceBuffer, uiState.destBuffer, JobType::Move);
+        // --- MIDDLE BAR: ACTIONS ---
+        ImGui::Spacing();
+        ImGui::Separator();
+        
+        float width = ImGui::GetWindowWidth();
+        ImGui::SetCursorPosX((width - 300) * 0.5f);
+        
+        bool canCopy = !leftBrowser.selectedPath.empty();
+
+        if (ImGui::Button("COPY >>>", ImVec2(140, 40)) && canCopy) {
+            transferManager.QueueJob(leftBrowser.selectedPath, rightBrowser.currentPath, JobType::Copy);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("MOVE >>>", ImVec2(140, 40)) && canCopy) {
+             transferManager.QueueJob(leftBrowser.selectedPath, rightBrowser.currentPath, JobType::Move);
+        }
+        ImGui::Separator();
+
+        // --- BOTTOM SECTION: QUEUE & CONTROLS ---
+        // We use Child windows to create distinct "Boxes" for the table and controls
+        
+        float bottomHeight = 250.0f;
+        float controlsWidth = 180.0f;
+        float tableWidth = ImGui::GetContentRegionAvail().x - controlsWidth - 10.0f; // 10px spacing
+
+        // 1. LEFT BOX: THE QUEUE TABLE
+        ImGui::BeginChild("QueueRegion", ImVec2(tableWidth, bottomHeight), true); // true = show border
+        
+        ImGui::Text("Active Transfer Queue");
+        ImGui::Separator();
+
+        auto queue = transferManager.GetQueue();
+
+        if (queue.empty()) {
+             // Clean "Empty State" message
+             float winHeight = ImGui::GetWindowHeight();
+             ImGui::SetCursorPosY(winHeight * 0.4f);
+             ImGui::SetCursorPosX(ImGui::GetWindowWidth() * 0.35f);
+             ImGui::TextDisabled("No active jobs pending.");
+        } 
+        else {
+            // TABLE STYLE: No Borders, just Row Backgrounds for a clean look
+            ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+            
+            if (ImGui::BeginTable("QueueTable", 6, tableFlags)) {
+                
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+                ImGui::TableSetupColumn("File", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("From", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("To",   ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                ImGui::TableHeadersRow();
+
+                for (int i = 0; i < queue.size(); i++) {
+                    auto job = queue[i];
+                    ImGui::PushID(i); 
+                    
+                    ImGui::TableNextRow();
+                    
+                    // Col 0: Type
+                    ImGui::TableSetColumnIndex(0);
+                    std::string typeLabel = (job->type == JobType::Copy) ? "COPY" : "MOVE";
+                    ImVec4 typeColor = (job->type == JobType::Copy) ? ImVec4(0.4f, 0.8f, 1.0f, 1) : ImVec4(1.0f, 0.6f, 0.2f, 1);
+                    
+                    ImGui::PushStyleColor(ImGuiCol_Text, typeColor);
+                    bool isSelected = (selectedQueueIndex == i);
+                    if (ImGui::Selectable(typeLabel.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        selectedQueueIndex = i;
+                    }
+                    ImGui::PopStyleColor();
+
+                    // Col 1: File
+                    ImGui::TableSetColumnIndex(1); 
+                    ImGui::Text("%s", job->source.filename().string().c_str());
+
+                    // Col 2: From
+                    ImGui::TableSetColumnIndex(2); 
+                    ImGui::Text("%s", job->source.parent_path().string().c_str());
+
+                    // Col 3: To
+                    ImGui::TableSetColumnIndex(3); 
+                    // FIX: Since we fixed QueueJob, this now correctly shows the parent folder of the full path
+                    ImGui::Text("%s", job->destination.parent_path().string().c_str());
+                    
+                    // Col 4: Status
+                    ImGui::TableSetColumnIndex(4); 
+                    const char* statusStr = "...";
+                    ImVec4 color = ImVec4(1,1,1,1);
+                    switch(job->status.load()) {
+                        case JobStatus::Pending: statusStr = "WAIT"; color = ImVec4(0.5,0.5,0.5,1); break;
+                        case JobStatus::Calculating: statusStr = "SCAN"; color = ImVec4(0,0.8,0.8,1); break;
+                        case JobStatus::Copying: statusStr = "BUSY"; color = ImVec4(0,1,1,1); break;
+                        case JobStatus::Paused:  statusStr = "PAUSE"; color = ImVec4(1,1,0,1); break;
+                        case JobStatus::Completed: statusStr = "DONE"; color = ImVec4(0,1,0,1); break; // Changed OK to DONE
+                        case JobStatus::Failed:  statusStr = "ERR"; color = ImVec4(1,0,0,1); break;
+                    }
+                    ImGui::TextColored(color, statusStr);
+
+                    // Col 5: Progress
+                    ImGui::TableSetColumnIndex(5);
+                    ImGui::ProgressBar(job->progress, ImVec2(-1, 0), ""); 
+
+                    ImGui::PopID(); 
+                }
+                ImGui::EndTable();
             }
         }
-        ImGui::PopStyleColor();
+        ImGui::EndChild(); // End Queue Box
 
-        ImGui::Columns(1); // Reset internal columns
+        ImGui::SameLine();
+
+        // 2. RIGHT BOX: CONTROLS
+        ImGui::BeginChild("ControlsRegion", ImVec2(0, bottomHeight), true); // 0 width = fill remaining
+        
+        ImGui::Text("Controls");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button("START ALL", ImVec2(-1, 30))) { transferManager.StartQueue(); }
+        ImGui::Spacing();
+        if (ImGui::Button("PAUSE ALL", ImVec2(-1, 30))) { 
+             if (transferManager.IsPaused()) transferManager.ResumeQueue();
+             else transferManager.PauseQueue();
+        }
         
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextWrapped("Tip: Use [Fold] to select entire folders. 'Copy' duplicates. 'Move' deletes source.");
-
-        ImGui::NextColumn(); 
-        
-        // --- RIGHT COLUMN: QUEUE ---
-
-        ImGui::Text("Active Transfer Queue");
-        
-        // Control Buttons
-        if (ImGui::Button(transferManager.IsRunning() ? "Running..." : "START QUEUE")) {
-            transferManager.StartQueue();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(transferManager.IsPaused() ? "RESUME" : "PAUSE")) {
-            if (transferManager.IsPaused()) transferManager.ResumeQueue();
-            else transferManager.PauseQueue();
-        }
-
         ImGui::Spacing();
 
-        // THE TABLE
-        if (ImGui::BeginTable("QueueTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-            
-            // Setup Headers
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-            ImGui::TableSetupColumn("File", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("From", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("To",   ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-            ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-            ImGui::TableSetupColumn("Act", ImGuiTableColumnFlags_WidthFixed, 40.0f); // Action (Delete)
-            ImGui::TableHeadersRow();
+        // Remove Logic
+        bool hasSelection = (selectedQueueIndex >= 0 && selectedQueueIndex < queue.size());
+        bool busy = false;
+        if (hasSelection && queue[selectedQueueIndex]->status == JobStatus::Copying) busy = true;
 
-            // Store index to delete (cannot delete while iterating)
-            int jobToRemove = -1;
-
-            auto queue = transferManager.GetQueue();
-            for (int i = 0; i < queue.size(); i++) {
-                auto job = queue[i];
-
-                ImGui::TableNextRow();
-                
-                // Col 0: TYPE
-                ImGui::TableSetColumnIndex(0);
-                if (job->type == JobType::Copy) 
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1), "CPY");
-                else 
-                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1), "MOV");
-
-                // Col 1: Filename
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%s", job->source.filename().string().c_str());
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", job->source.string().c_str());
-
-                // Col 2: Source Folder (Parent Path)
-                ImGui::TableSetColumnIndex(2);
-                std::string srcFolder = job->source.parent_path().string();
-                ImGui::Text("%s", srcFolder.c_str());
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", srcFolder.c_str());
-
-                // Col 3: Dest Folder (Parent Path)
-                ImGui::TableSetColumnIndex(3);
-                std::string destFolder = job->destination.parent_path().string();
-                if (destFolder.empty()) destFolder = job->destination.string();
-                ImGui::Text("%s", destFolder.c_str());
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", destFolder.c_str());
-
-                // Col 4: Status
-                ImGui::TableSetColumnIndex(4);
-                const char* statusStr = "...";
-                ImVec4 color = ImVec4(1,1,1,1);
-                switch(job->status.load()) {
-                    case JobStatus::Pending: statusStr = "WAIT"; color = ImVec4(0.5,0.5,0.5,1); break;
-                    case JobStatus::Calculating: statusStr = "SCAN";  color = ImVec4(0.0f, 0.8f, 0.8f, 1.0f); break;
-                    case JobStatus::Copying: statusStr = "BUSY"; color = ImVec4(0,1,1,1); break;
-                    case JobStatus::Paused:  statusStr = "PAUSE";color = ImVec4(1,1,0,1); break;
-                    case JobStatus::Completed: statusStr = "OK"; color = ImVec4(0,1,0,1); break;
-                    case JobStatus::Failed:  statusStr = "ERR";  color = ImVec4(1,0,0,1); break;
-                }
-                ImGui::TextColored(color, statusStr);
-                if (job->status == JobStatus::Failed && ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Error: %s", job->errorMessage.c_str());
-                }
-
-                // Col 5: Progressgit
-                ImGui::TableSetColumnIndex(5);
-                ImGui::ProgressBar(job->progress, ImVec2(-1, 0), ""); 
-
-                // Col 6: Action (Delete)
-                ImGui::TableSetColumnIndex(6);
-                ImGui::PushID(i); // Unique ID for button
-                
-                // Disable delete if currently copying
-                if (job->status == JobStatus::Copying) ImGui::BeginDisabled();
-                if (ImGui::Button("X")) {
-                    jobToRemove = i;
-                }
-                if (job->status == JobStatus::Copying) ImGui::EndDisabled();
-                
-                ImGui::PopID();
-            }
-
-            ImGui::EndTable();
-
-            // Perform Deletion Safely
-            if (jobToRemove != -1) {
-                transferManager.RemoveJob(jobToRemove);
-            }
+        if (!hasSelection || busy) ImGui::BeginDisabled();
+        
+        if (ImGui::Button("REMOVE ITEM", ImVec2(-1, 30))) {
+            transferManager.RemoveJob(selectedQueueIndex);
+            selectedQueueIndex = -1; 
         }
 
-        ImGui::End(); // End Dashboard
-        // --- SYSBUTLER UI END ---
+        if (!hasSelection || busy) ImGui::EndDisabled();
 
-        // --- RENDER ---
-        ImGui::Render(); // <--- THIS WAS MISSING AND CAUSED THE CRASH
-        
+        ImGui::Spacing();
+        if (!hasSelection) ImGui::TextWrapped("Select a job to remove it");
+
+        ImGui::EndChild(); // End Controls Box
+
+        ImGui::End(); // End Main Window
+
+        // Rendering...
+        ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f); 
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }

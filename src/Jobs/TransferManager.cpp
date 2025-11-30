@@ -66,7 +66,16 @@ void TransferManager::QueueJob(const std::filesystem::path& src, const std::file
     std::lock_guard<std::mutex> lock(m_queueMutex);
     auto job = std::make_shared<FileJob>();
     job->source = src;
-    job->destination = dest;
+    
+    // FIX: Pre-calculate the full destination path immediately.
+    // This ensures the UI shows the full path (e.g., ".../Movies/File.mkv") 
+    // instead of just the folder (".../Movies") while waiting.
+    std::filesystem::path finalDest = dest;
+    if (std::filesystem::is_directory(finalDest)) {
+        finalDest /= src.filename();
+    }
+    job->destination = finalDest;
+
     job->type = type; 
     job->status = JobStatus::Pending;
     m_queue.push_back(job);
@@ -125,7 +134,6 @@ void TransferManager::WorkerLoop() {
 
         // 1. Resolve Destination
         std::filesystem::path finalDest = currentJob->destination;
-        std::error_code ec;
 
         // If Dest is a directory (or we force it to be one because source is folder), append source name
         if (std::filesystem::is_directory(finalDest) || std::filesystem::is_directory(currentJob->source)) {
@@ -137,7 +145,7 @@ void TransferManager::WorkerLoop() {
         }
 
         finalDest = GetUniquePath(finalDest);
-        currentJob->destination = finalDest; // Update UI
+        currentJob->destination = finalDest; // Update UI with the (1) version if needed
 
         // 2. CHECK: IS THIS A FOLDER?
         bool isFolder = std::filesystem::is_directory(currentJob->source);
