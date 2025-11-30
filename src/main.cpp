@@ -11,6 +11,7 @@
 #include <windows.h> // For GetLogicalDrives
 #include <algorithm> // For search case-insensitivity
 #include <cctype>
+#include <set> // Required for multiple selection
 
 // YOUR HEADERS
 #include "Jobs/TransferManager.h"
@@ -29,12 +30,12 @@ struct FileEntry {
 
 struct BrowserState {
     fs::path currentPath;
-    fs::path selectedPath; 
+    // REPLACED: Single index with a set of indices for multiple selection
+    std::set<int> selectedIndices; 
+    int lastClickedIndex = -1; // For Shift+Click range selection
+
     std::vector<FileEntry> entries;
-    int selectedIndex = -1;
     char currentDrive = 'C';
-    
-    // NEW: Search Buffer
     char searchFilter[256] = ""; 
 
     BrowserState() {
@@ -44,9 +45,8 @@ struct BrowserState {
 
     void Refresh() {
         entries.clear();
-        // Note: We do NOT reset selectedIndex here if we are trying to preserve selection,
-        // but typically a refresh invalidates indices. We will handle "Jump to File" separately.
-        selectedIndex = -1; 
+        selectedIndices.clear(); // Clear selection on refresh
+        lastClickedIndex = -1;
         
         try {
             for (const auto& entry : fs::directory_iterator(currentPath)) {
@@ -63,48 +63,69 @@ struct BrowserState {
         } catch (...) {}
     }
 
+    // Helper to get all selected paths for the TransferManager
+    std::vector<fs::path> GetSelectedPaths() {
+        std::vector<fs::path> result;
+        for (int index : selectedIndices) {
+            if (index >= 0 && index < entries.size()) {
+                result.push_back(entries[index].path);
+            }
+        }
+        return result;
+    }
+
+    // Helper to generate the display path string (e.g., "C:\Docs\*" or "C:\Docs\File.txt")
+    std::string GetDisplayPath() {
+        std::string str = currentPath.string();
+        
+        // Remove trailing slash for consistency if root
+        if (str.length() > 3 && str.back() == '\\') str.pop_back();
+
+        if (selectedIndices.size() == 1) {
+            int idx = *selectedIndices.begin();
+            if (idx < entries.size()) {
+                // Check if we need a separator
+                if (str.back() != '\\') str += "\\";
+                str += entries[idx].path.filename().string();
+            }
+        } else if (selectedIndices.size() > 1) {
+            if (str.back() != '\\') str += "\\";
+            str += "*"; // The requested "*" symbol
+        }
+        return str;
+    }
+
+    // ... (NavigateToFile, NavigateUp, ChangeDrive remain the same) ...
     void NavigateToFile(const std::filesystem::path& targetFile) {
         if (!fs::exists(targetFile)) return;
-
-        // 1. Change Directory to the file's parent
         currentPath = targetFile.parent_path();
-        
-        // 2. Update Drive Letter
         std::string pathStr = currentPath.string();
-        if (pathStr.length() >= 2 && pathStr[1] == ':') {
-            currentDrive = toupper(pathStr[0]);
-        }
-
-        // 3. Refresh the list to load new files
+        if (pathStr.length() >= 2 && pathStr[1] == ':') currentDrive = toupper(pathStr[0]);
         Refresh();
-
-        // 4. Find and Select the specific file
-        selectedPath = targetFile;
-        // Clear search so the file is actually visible
+        
+        // Find and select the specific file
         memset(searchFilter, 0, sizeof(searchFilter)); 
-
         for (int i = 0; i < entries.size(); i++) {
             if (entries[i].path == targetFile) {
-                selectedIndex = i;
+                selectedIndices.insert(i);
+                lastClickedIndex = i;
                 break;
             }
         }
     }
 
-    void NavigateUp() { /* ... existing code ... */ 
+    void NavigateUp() {
         if (currentPath.has_parent_path() && currentPath != currentPath.root_path()) {
             currentPath = currentPath.parent_path();
             Refresh();
-            selectedPath.clear();
         }
     }
     
-    void ChangeDrive(char driveLetter) { /* ... existing code ... */ 
+    void ChangeDrive(char driveLetter) {
         std::string d = std::string(1, driveLetter) + ":\\";
         currentPath = d;
         currentDrive = driveLetter;
         Refresh();
-        selectedPath.clear();
     }
 };
 
@@ -122,57 +143,38 @@ void RenderFileBrowser(const char* id, BrowserState& state, float height) {
     ImGui::PushID(id);
     ImGui::BeginGroup();
 
-    // --- TOOLBAR ROW ---
-    
-    // 1. Up Arrow (Replaces ".." button)
-    // ImGuiDir_Up renders a small triangle pointing up
-    if (ImGui::ArrowButton("##up", ImGuiDir_Up)) { 
-        state.NavigateUp(); 
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to Parent Folder");
-
+    // --- TOOLBAR (Arrow, Drive, Search, ...) ---
+    if (ImGui::ArrowButton("##up", ImGuiDir_Up)) { state.NavigateUp(); }
     ImGui::SameLine();
 
-    // 2. Drive Selector
-    char driveLabel[4] = "C:\\";
-    driveLabel[0] = state.currentDrive;
+    char driveLabel[4] = "C:\\"; driveLabel[0] = state.currentDrive;
     ImGui::SetNextItemWidth(50);
     if (ImGui::BeginCombo("##drive", driveLabel)) {
         DWORD mask = GetLogicalDrives();
         for (char c = 'A'; c <= 'Z'; c++) {
             if (mask & 1) {
                 char d[4] = "X:\\"; d[0] = c;
-                if (ImGui::Selectable(d, state.currentDrive == c)) {
-                    state.ChangeDrive(c);
-                }
+                if (ImGui::Selectable(d, state.currentDrive == c)) state.ChangeDrive(c);
             }
             mask >>= 1;
         }
         ImGui::EndCombo();
     }
-
     ImGui::SameLine();
 
-    // 3. Search Box (Takes available width minus the space needed for the "..." button)
     float availableWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::SetNextItemWidth(availableWidth - 40.0f); // Leave 40px for the "..." button
+    ImGui::SetNextItemWidth(availableWidth - 40.0f);
     ImGui::InputTextWithHint("##search", "Search files...", state.searchFilter, IM_ARRAYSIZE(state.searchFilter));
-
     ImGui::SameLine();
 
-    // 4. "..." Button (Native Explorer Integration)
     if (ImGui::Button("...")) {
-        // Use your existing PlatformUtils to pick a file
         std::string picked = PlatformUtils::OpenFilePicker();
-        if (!picked.empty()) {
-            state.NavigateToFile(std::filesystem::path(picked));
-        }
+        if (!picked.empty()) state.NavigateToFile(std::filesystem::path(picked));
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Locate file using Windows Explorer");
 
-    // --- PATH DISPLAY ---
-    // Small text showing full current path
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", state.currentPath.string().c_str());
+    // --- PATH DISPLAY (Dynamic) ---
+    // Gray text showing: Folder\File.txt or Folder\*
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", state.GetDisplayPath().c_str());
 
     // --- FILE LIST ---
     ImGui::BeginChild("Files", ImVec2(0, height), true);
@@ -180,31 +182,51 @@ void RenderFileBrowser(const char* id, BrowserState& state, float height) {
     for (int i = 0; i < state.entries.size(); i++) {
         const auto& entry = state.entries[i];
         
-        // FILTER LOGIC: Skip item if it doesn't match search
-        if (!StringContains(entry.path.filename().string(), state.searchFilter)) {
-            continue;
-        }
+        // Filter Logic
+        if (!StringContains(entry.path.filename().string(), state.searchFilter)) continue;
 
-        bool isSelected = (state.selectedIndex == i);
+        // Selection State
+        bool isSelected = (state.selectedIndices.find(i) != state.selectedIndices.end());
         
-        // Render Item
         if (ImGui::Selectable(entry.displayString.c_str(), isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
-            state.selectedIndex = i;
-            state.selectedPath = entry.path;
             
+            // --- SELECTION LOGIC ---
+            if (ImGui::GetIO().KeyCtrl) {
+                // CTRL+Click: Toggle selection
+                if (isSelected) state.selectedIndices.erase(i);
+                else state.selectedIndices.insert(i);
+                state.lastClickedIndex = i;
+            }
+            else if (ImGui::GetIO().KeyShift && state.lastClickedIndex != -1) {
+                // SHIFT+Click: Range selection
+                // We clear current selection unless Ctrl is also held (standard explorer behavior varies, but this is cleanest)
+                state.selectedIndices.clear();
+                
+                int start = min(state.lastClickedIndex, i);
+                int end = max(state.lastClickedIndex, i);
+                
+                // Select everything in range (including hidden ones if filter is active, to keep it simple and consistent)
+                for (int k = start; k <= end; k++) {
+                    state.selectedIndices.insert(k);
+                }
+            }
+            else {
+                // Normal Click: Clear others, select this one
+                state.selectedIndices.clear();
+                state.selectedIndices.insert(i);
+                state.lastClickedIndex = i;
+            }
+
+            // Handle Double Click (Navigation)
             if (ImGui::IsMouseDoubleClicked(0) && entry.isDirectory) {
                 state.currentPath = entry.path;
-                // Clear search when entering a new folder so we see contents
                 memset(state.searchFilter, 0, sizeof(state.searchFilter));
                 state.Refresh();
-                state.selectedPath = state.currentPath;
             }
         }
-
-        // Auto-scroll to selection if we just jumped here (optional polish)
-        if (isSelected && ImGui::IsWindowAppearing()) {
-            ImGui::SetScrollHereY();
-        }
+        
+        // Auto-scroll on initial selection jump
+        if (isSelected && ImGui::IsWindowAppearing()) ImGui::SetScrollHereY();
     }
     ImGui::EndChild();
 
@@ -323,15 +345,24 @@ int main(int, char**)
         float width = ImGui::GetWindowWidth();
         ImGui::SetCursorPosX((width - 300) * 0.5f);
         
-        bool canCopy = !leftBrowser.selectedPath.empty();
+        // Get selected items
+        std::vector<fs::path> sources = leftBrowser.GetSelectedPaths();
+        bool canCopy = !sources.empty();
 
         if (ImGui::Button("COPY >>>", ImVec2(140, 40)) && canCopy) {
-            transferManager.QueueJob(leftBrowser.selectedPath, rightBrowser.currentPath, JobType::Copy);
+            for (const auto& src : sources) {
+                // Queue each file individually. 
+                // TransferManager will handle the queuing logic for each.
+                transferManager.QueueJob(src, rightBrowser.currentPath, JobType::Copy);
+            }
         }
         ImGui::SameLine();
         if (ImGui::Button("MOVE >>>", ImVec2(140, 40)) && canCopy) {
-             transferManager.QueueJob(leftBrowser.selectedPath, rightBrowser.currentPath, JobType::Move);
+             for (const auto& src : sources) {
+                transferManager.QueueJob(src, rightBrowser.currentPath, JobType::Move);
+             }
         }
+        
         ImGui::Separator();
 
         // --- BOTTOM SECTION: QUEUE & CONTROLS ---
