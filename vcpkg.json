@@ -1,0 +1,15 @@
+{
+  "name": "system-butler",
+  "version": "1.0.0",
+  "dependencies": [
+    "imgui",
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    },
+    "glfw3"
+  ]
+}
