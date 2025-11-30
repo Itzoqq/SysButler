@@ -6,7 +6,12 @@
 
 class PlatformUtils {
 public:
-    // Existing File Picker
+    /**
+     * @brief Opens the native Windows File Picker dialog.
+     * * Configured to select a single file. Returns the absolute path of the selected file,
+     * or an empty string if the user cancels.
+     * * @return std::string Absolute path to the selected file.
+     */
     static std::string OpenFilePicker() {
         OPENFILENAMEA ofn;
         CHAR szFile[260] = { 0 };
@@ -22,7 +27,11 @@ public:
         return "";
     }
 
-    // NEW: Proper Folder Picker
+    /**
+     * @brief Opens the native Windows Folder Picker dialog (IFileOpenDialog).
+     * * Uses the modern COM-based dialog to allow folder selection.
+     * * @return std::string Absolute path to the selected folder.
+     */
     static std::string OpenFolderPicker() {
         std::string result = "";
         IFileOpenDialog* pFileOpen;

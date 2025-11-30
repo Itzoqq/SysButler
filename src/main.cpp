@@ -7,9 +7,15 @@
 
 #include "Jobs/TransferManager.h"
 #include "Core/Logger.h"
-#include "UI/FileBrowser.h" // Include our new modular component
+#include "UI/FileBrowser.h" 
 
-// Helper to count completed jobs for auto-refresh logic
+/**
+ * @brief Counts the number of jobs that have been completed.
+ * * This helper function is used by the main loop to detect when a job finishes
+ * so that the file browser UIs can be auto-refreshed.
+ * * @param queue The deque of jobs to check.
+ * @return int The count of completed jobs.
+ */
 int CountCompletedJobs(const std::deque<std::shared_ptr<FileJob>>& queue) {
     int count = 0;
     for (const auto& job : queue) {
@@ -18,8 +24,14 @@ int CountCompletedJobs(const std::deque<std::shared_ptr<FileJob>>& queue) {
     return count;
 }
 
+/**
+ * @brief The application entry point.
+ * * Initializes COM, Logger, GLFW, and ImGui.
+ * Contains the main application loop which renders the UI and manages global state.
+ */
 int main(int, char**)
 {
+    // Initialize COM for native dialog support
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     ButlerLogger::Init();
@@ -60,7 +72,7 @@ int main(int, char**)
     {
         glfwPollEvents();
 
-        // Auto-Refresh Logic
+        // Check for Auto-Refresh (If a job finished, refresh file lists)
         int currentCompletedCount = CountCompletedJobs(transferManager.GetQueue());
         if (currentCompletedCount > previousCompletedCount) {
             leftBrowser.Refresh();
@@ -102,6 +114,7 @@ int main(int, char**)
         float width = ImGui::GetWindowWidth();
         ImGui::SetCursorPosX((width - 300) * 0.5f);
         
+        // Batch Processing Logic
         std::vector<fs::path> sources = leftBrowser.GetSelectedPaths();
         bool canCopy = !sources.empty();
 
@@ -124,7 +137,7 @@ int main(int, char**)
         float controlsWidth = 180.0f;
         float tableWidth = ImGui::GetContentRegionAvail().x - controlsWidth - 10.0f;
 
-        // Queue Table Child
+        // 1. Queue Table Child
         ImGui::BeginChild("QueueRegion", ImVec2(tableWidth, bottomHeight), true);
         ImGui::Text("Active Transfer Queue");
         ImGui::Separator();
@@ -189,7 +202,7 @@ int main(int, char**)
 
         ImGui::SameLine();
 
-        // Controls Child
+        // 2. Controls Child
         ImGui::BeginChild("ControlsRegion", ImVec2(0, bottomHeight), true);
         ImGui::Text("Controls");
         ImGui::Separator();

@@ -2,7 +2,13 @@
 #include "../Core/PlatformUtils.h"
 #include <cctype> // For toupper
 
-// Helper for case-insensitive search
+/**
+ * @brief Helper function for case-insensitive string search.
+ * * @param haystack The text to search within.
+ * @param needle The substring to search for.
+ * @return true If needle is found in haystack (case-insensitive).
+ * @return false If needle is not found.
+ */
 static bool StringContains(const std::string& haystack, const std::string& needle) {
     if (needle.empty()) return true;
     auto it = std::search(
@@ -13,11 +19,20 @@ static bool StringContains(const std::string& haystack, const std::string& needl
     return (it != haystack.end());
 }
 
+/**
+ * @brief Constructs the FileBrowser and initializes it to the application root directory.
+ */
 FileBrowser::FileBrowser() {
     m_currentPath = fs::current_path().root_path();
     Refresh();
 }
 
+/**
+ * @brief Refreshes the internal list of files and directories for the current path.
+ * * This function clears current entries and selection, then iterates over the filesystem.
+ * Entries are sorted: Directories first, then files alphabetically.
+ * Exceptions (e.g., access denied) are silently caught.
+ */
 void FileBrowser::Refresh() {
     m_entries.clear();
     m_selectedIndices.clear();
@@ -42,6 +57,10 @@ void FileBrowser::Refresh() {
     }
 }
 
+/**
+ * @brief Retrieves the paths of all currently selected items in the browser.
+ * * @return std::vector<fs::path> A list of selected paths.
+ */
 std::vector<fs::path> FileBrowser::GetSelectedPaths() const {
     std::vector<fs::path> result;
     for (int index : m_selectedIndices) {
@@ -52,6 +71,12 @@ std::vector<fs::path> FileBrowser::GetSelectedPaths() const {
     return result;
 }
 
+/**
+ * @brief Generates a display string for the current path header.
+ * * If multiple files are selected, it appends a wildcard (*) to indicate multiple items.
+ * If one file is selected, it appends the filename.
+ * * @return std::string The formatted path string.
+ */
 std::string FileBrowser::GetDisplayPath() const {
     std::string str = m_currentPath.string();
     
@@ -71,6 +96,13 @@ std::string FileBrowser::GetDisplayPath() const {
     return str;
 }
 
+/**
+ * @brief Renders the entire File Browser UI component.
+ * * Includes the toolbar (Up, Drive, Search, Explorer) and the file list.
+ * Handles input events for selection (Click, Ctrl+Click, Shift+Click) and navigation (Double Click).
+ * * @param id The unique ImGui ID for this panel.
+ * @param height The height of the scrolling file list area.
+ */
 void FileBrowser::Render(const char* id, float height) {
     ImGui::PushID(id);
     ImGui::BeginGroup();
@@ -163,6 +195,9 @@ void FileBrowser::Render(const char* id, float height) {
     ImGui::PopID();
 }
 
+/**
+ * @brief Navigates to the parent directory of the current path.
+ */
 void FileBrowser::NavigateUp() {
     if (m_currentPath.has_parent_path() && m_currentPath != m_currentPath.root_path()) {
         m_currentPath = m_currentPath.parent_path();
@@ -170,6 +205,10 @@ void FileBrowser::NavigateUp() {
     }
 }
 
+/**
+ * @brief Switches the current path to the root of a specified drive.
+ * * @param driveLetter The drive letter to switch to (e.g., 'C', 'D').
+ */
 void FileBrowser::ChangeDrive(char driveLetter) {
     std::string d = std::string(1, driveLetter) + ":\\";
     m_currentPath = d;
@@ -177,6 +216,11 @@ void FileBrowser::ChangeDrive(char driveLetter) {
     Refresh();
 }
 
+/**
+ * @brief Navigates to a specific file's parent directory and selects the file.
+ * * Used for deep-linking from the native file picker.
+ * * @param targetFile The full path to the file to navigate to.
+ */
 void FileBrowser::NavigateToFile(const fs::path& targetFile) {
     if (!fs::exists(targetFile)) return;
     
@@ -186,6 +230,7 @@ void FileBrowser::NavigateToFile(const fs::path& targetFile) {
     
     Refresh();
     
+    // Select the file and clear filters so it is visible
     memset(m_searchFilter, 0, sizeof(m_searchFilter));
     for (int i = 0; i < m_entries.size(); i++) {
         if (m_entries[i].path == targetFile) {

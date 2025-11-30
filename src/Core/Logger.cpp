@@ -6,6 +6,12 @@
 std::ofstream ButlerLogger::m_logFile;
 std::mutex ButlerLogger::m_logMutex;
 
+/**
+ * @brief Initializes the logging subsystem.
+ * * This function checks for the existence of the "logs" directory and creates it if missing.
+ * It then opens the "sysbutler_core.log" file in append mode and writes a session start header.
+ * Thread-safety is ensured via a mutex.
+ */
 void ButlerLogger::Init() {
     std::lock_guard<std::mutex> lock(m_logMutex);
     
@@ -23,6 +29,13 @@ void ButlerLogger::Init() {
     }
 }
 
+/**
+ * @brief Writes a formatted log message to the log file and standard console.
+ * * The message is prefixed with a current timestamp and the severity level.
+ * The output is flushed immediately to ensure logs are captured even in the event of a crash.
+ * * @param level The severity level of the log (DEBUG, INFO, WARN, ERR).
+ * @param message The content string to log.
+ */
 void ButlerLogger::Log(LogLevel level, const std::string& message) {
     std::lock_guard<std::mutex> lock(m_logMutex);
     
@@ -40,6 +53,10 @@ void ButlerLogger::Log(LogLevel level, const std::string& message) {
     std::cout << finalMsg << std::endl;
 }
 
+/**
+ * @brief Generates a string representation of the current system time.
+ * * @return std::string formatted as "YYYY-MM-DD HH:MM:SS".
+ */
 std::string ButlerLogger::GetTimeStamp() {
     std::time_t now = std::time(nullptr);
     std::tm localTime;
@@ -50,6 +67,11 @@ std::string ButlerLogger::GetTimeStamp() {
     return oss.str();
 }
 
+/**
+ * @brief Converts the LogLevel enum to a readable string representation.
+ * * @param level The log level to convert.
+ * @return std::string The string representation (e.g., "INFO ", "ERROR").
+ */
 std::string ButlerLogger::LevelToString(LogLevel level) {
     switch (level) {
         case LogLevel::DEBUG: return "DEBUG";
